@@ -1,6 +1,7 @@
 import { ObjectId } from "mongodb";
 import { COLLECTIONS } from "../backend/schemaContracts.js";
 import { isFeatureFlagEnabled } from "../featureFlags.js";
+import { getNotificationDelivery } from "./preferences.js";
 
 // #794: server-side notifications for events a user has to act on or know
 // about. Recipient is always the session user id (`sub`), and every read or
@@ -46,6 +47,27 @@ export const FEATURE_FLAG_GATED_TYPES = new Set([
   "wallet_recovery_completed",
 ]);
 
+/**
+ * Delivery lifecycle for a notification (#834). A notification is created
+ * `pending`; a delivery attempt moves it to `sent` on success or `failed` on
+ * the first error, and `exhausted` once retries reach `maxAttempts`.
+ *
+ * `sent` and `exhausted` are terminal: a retry never re-sends a `sent`
+ * notification (so a retried source event can't double-notify) and never
+ * re-runs an `exhausted` one.
+ */
+export const DELIVERY_STATUSES = Object.freeze({
+  pending: "pending",
+  sent: "sent",
+  failed: "failed",
+  exhausted: "exhausted",
+  // #976: an optional notification the user opted out of. The record is kept
+  // for audit, but it is set at creation only and never delivered.
+  suppressed: "suppressed",
+});
+
+const MAX_DELIVERY_ERROR_LENGTH = 200;
+
 // Deep links must stay on this app: a stored "//evil.com" or absolute URL
 // would turn a trusted notification into an open redirect.
 function isInternalLink(link) {
@@ -53,15 +75,33 @@ function isInternalLink(link) {
 }
 
 /**
+ * Reduce a delivery error to a short, sensitive-safe diagnostic. Stack traces
+ * and arbitrary error payloads can carry PII or internal detail, so only the
+ * message is kept — whitespace-collapsed and length-capped.
+ */
+function safeDeliveryError(error) {
+  const raw = typeof error === "string" ? error : error?.message;
+  const message = (raw ? String(raw) : "delivery_failed").replace(/\s+/g, " ").trim();
+  return message.slice(0, MAX_DELIVERY_ERROR_LENGTH) || "delivery_failed";
+}
+
+/**
  * Create a notification exactly once per (recipient, dedupeKey). Retried
  * events reuse the same dedupeKey, so the upsert only inserts the first time.
- * Returns { created } — false when it already existed.
+ * Returns { created } — false when it already existed (and, crucially, when it
+ * did, its delivery state is left untouched, so a retried event never re-sends
+ * or resets an already-delivered notification).
  */
 export async function notify(db, { recipient, type, dedupeKey, title, message, link = null }) {
   if (!recipient || !dedupeKey) throw new Error("notify requires recipient and dedupeKey");
   if (!NOTIFICATION_TYPES[type]) throw new Error(`Unknown notification type: ${type}`);
   if (link !== null && !isInternalLink(link)) throw new Error("Notification link must be an internal path");
 
+  // #976: mandatory types always deliver. An opted-out optional type is still
+  // written, marked suppressed, so the decision stays auditable.
+  const delivery = await getNotificationDelivery(db, recipient, type);
+
+  const now = new Date();
   const doc = {
     recipient: String(recipient),
     type,
@@ -72,7 +112,17 @@ export async function notify(db, { recipient, type, dedupeKey, title, message, l
     link,
     read: false,
     readAt: null,
-    createdAt: new Date(),
+    suppressed: !delivery.deliver,
+    suppressedReason: delivery.deliver ? null : delivery.reason,
+    // Delivery tracking (#834): a fresh notification starts pending; state is
+    // only ever advanced by recordDeliveryAttempt/retryFailedDelivery.
+    deliveryStatus: delivery.deliver ? DELIVERY_STATUSES.pending : DELIVERY_STATUSES.suppressed,
+    attempts: 0,
+    lastAttemptAt: null,
+    lastError: null,
+    sentAt: null,
+    createdAt: now,
+    updatedAt: now,
   };
 
   try {
@@ -87,6 +137,145 @@ export async function notify(db, { recipient, type, dedupeKey, title, message, l
     if (err?.code === 11000) return { created: false };
     throw err;
   }
+}
+
+/**
+ * Record one delivery attempt against a notification. Increments `attempts`
+ * and moves `deliveryStatus` to the given value.
+ *
+ * When `recipient` is provided the update is scoped to that recipient, so one
+ * user can never flip another user's delivery state. A `failed`/`exhausted`
+ * outcome is also refused against a notification already in the terminal
+ * `sent` state (`deliveryStatus: { $ne: "sent" }`), so a late or racing
+ * failure can never un-send a delivered notification.
+ *
+ * @returns {Promise<{ updated: boolean, deliveryStatus: string|null, attempts: number|null }>}
+ */
+export async function recordDeliveryAttempt(db, id, { recipient, status, error = null } = {}) {
+  if (!ObjectId.isValid(id)) return { updated: false, deliveryStatus: null, attempts: null };
+  if (!DELIVERY_STATUSES[status]) throw new Error(`Unknown delivery status: ${status}`);
+  if (status === DELIVERY_STATUSES.suppressed) throw new Error("suppressed is set when a notification is created, not by delivery");
+
+  const now = new Date();
+  const filter = { _id: new ObjectId(id), ...(recipient ? { recipient: String(recipient) } : {}) };
+  if (status !== DELIVERY_STATUSES.sent) filter.deliveryStatus = { $ne: DELIVERY_STATUSES.sent };
+
+  const update = {
+    $set: {
+      deliveryStatus: status,
+      lastAttemptAt: now,
+      updatedAt: now,
+      lastError: status === DELIVERY_STATUSES.sent ? null : safeDeliveryError(error),
+    },
+    $inc: { attempts: 1 },
+  };
+  if (status === DELIVERY_STATUSES.sent) update.$set.sentAt = now;
+
+  const updated = await db
+    .collection(COLLECTIONS.notifications)
+    .findOneAndUpdate(filter, update, { returnDocument: "after" });
+
+  if (!updated) return { updated: false, deliveryStatus: null, attempts: null };
+  return { updated: true, deliveryStatus: updated.deliveryStatus, attempts: updated.attempts ?? 0 };
+}
+
+/**
+ * Safely (re)deliver a notification through `deliverFn`.
+ *
+ *   • `deliverFn(publicPayload)` is called at most once per invocation, with a
+ *     recipient-scoped, `toPublic`-shaped payload (no recipient/dedupeKey), so
+ *     a delivery callback can never leak another user's data.
+ *   • A notification already `sent` is never delivered again — this is the
+ *     duplicate-event / double-send guard.
+ *   • An `exhausted` notification is not retried automatically.
+ *   • `recipient` scopes the lookup and the update, so another user's
+ *     notification can never be read or flipped.
+ *
+ * Returns a diagnostic object with the resulting `deliveryStatus`, `attempts`
+ * (so far), `maxAttempts`, and the sanitized `error` on failure.
+ *
+ * @param {import('mongodb').Db} db
+ * @param {string} id
+ * @param {(payload: object) => Promise<void>} deliverFn
+ * @param {{ recipient?: string, maxAttempts?: number }} [options]
+ * @returns {Promise<{ outcome: string, deliveryStatus?: string, attempts?: number, maxAttempts?: number, error?: string, doubleSendPrevented?: boolean }>}
+ */
+export async function retryFailedDelivery(db, id, deliverFn, { recipient, maxAttempts = 3 } = {}) {
+  if (typeof deliverFn !== "function") throw new Error("retryFailedDelivery requires a deliverFn");
+  if (!ObjectId.isValid(id)) return { outcome: "not_found" };
+
+  const filter = { _id: new ObjectId(id), ...(recipient ? { recipient: String(recipient) } : {}) };
+  const doc = await db.collection(COLLECTIONS.notifications).findOne(filter);
+  if (!doc) return { outcome: "not_found" };
+
+  if (doc.suppressed === true) {
+    return { outcome: "suppressed", deliveryStatus: DELIVERY_STATUSES.suppressed, attempts: doc.attempts ?? 0 };
+  }
+  if (doc.deliveryStatus === DELIVERY_STATUSES.sent) {
+    return {
+      outcome: "already_sent",
+      deliveryStatus: DELIVERY_STATUSES.sent,
+      attempts: doc.attempts ?? 0,
+      doubleSendPrevented: true,
+    };
+  }
+  if (doc.deliveryStatus === DELIVERY_STATUSES.exhausted) {
+    return {
+      outcome: "exhausted",
+      deliveryStatus: DELIVERY_STATUSES.exhausted,
+      attempts: doc.attempts ?? 0,
+      maxAttempts,
+    };
+  }
+
+  const previousAttempts = doc.attempts ?? 0;
+
+  try {
+    await deliverFn(toPublic(doc));
+    const recorded = await recordDeliveryAttempt(db, id, { recipient, status: DELIVERY_STATUSES.sent });
+    return {
+      outcome: "sent",
+      deliveryStatus: DELIVERY_STATUSES.sent,
+      attempts: recorded.attempts ?? previousAttempts + 1,
+    };
+  } catch (error) {
+    const attempts = previousAttempts + 1;
+    const status = attempts >= maxAttempts ? DELIVERY_STATUSES.exhausted : DELIVERY_STATUSES.failed;
+    await recordDeliveryAttempt(db, id, { recipient, status, error });
+    return {
+      outcome: status,
+      deliveryStatus: status,
+      attempts,
+      maxAttempts,
+      error: safeDeliveryError(error),
+    };
+  }
+}
+
+/**
+ * Operator-facing diagnostics for failed deliveries, scoped to one recipient
+ * so a caller can only ever inspect their own inbox's delivery failures.
+ * `lastError` is already sanitized by `recordDeliveryAttempt`.
+ */
+export async function getDeliveryDiagnostics(db, recipient, { limit = 50 } = {}) {
+  const docs = await db
+    .collection(COLLECTIONS.notifications)
+    .find({
+      recipient: String(recipient),
+      deliveryStatus: { $in: [DELIVERY_STATUSES.failed, DELIVERY_STATUSES.exhausted] },
+    })
+    .sort({ lastAttemptAt: -1 })
+    .limit(limit)
+    .toArray();
+
+  return docs.map((doc) => ({
+    id: String(doc._id),
+    type: doc.type,
+    deliveryStatus: doc.deliveryStatus,
+    attempts: doc.attempts ?? 0,
+    lastAttemptAt: doc.lastAttemptAt ?? null,
+    lastError: doc.lastError ?? null,
+  }));
 }
 
 function toPublic(doc) {
@@ -156,10 +345,12 @@ export async function notifyWalletRecipient(db, event) {
 
 export async function listNotifications(db, recipient, { unreadOnly = false, limit = 20 } = {}) {
   const col = db.collection(COLLECTIONS.notifications);
-  const filter = { recipient: String(recipient), ...(unreadOnly ? { read: false } : {}) };
+  // Suppressed records are audit-only and never reach the inbox.
+  const visible = { recipient: String(recipient), suppressed: { $ne: true } };
+  const filter = { ...visible, ...(unreadOnly ? { read: false } : {}) };
   const [docs, unreadCount] = await Promise.all([
     col.find(filter).sort({ createdAt: -1 }).limit(limit).toArray(),
-    col.countDocuments({ recipient: String(recipient), read: false }),
+    col.countDocuments({ ...visible, read: false }),
   ]);
   return { notifications: docs.map(toPublic), unreadCount };
 }

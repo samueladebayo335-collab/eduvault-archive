@@ -1,216 +1,256 @@
 /**
- * Canonical serialization for EduVault hashed/signed payloads.
+ * Canonical serialization and input normalization for EduVault.
  *
- * Purpose:
- *   Equivalent payloads (key order, whitespace, casing, numeric precision)
- *   must produce the same byte-for-byte output so that hashes, signatures,
- *   comparisons, and verifications are deterministic across clients and nodes.
+ * Any payload that is signed, hashed, compared, or settled must pass through
+ * this module so that equivalent inputs always produce the same byte
+ * representation. The rules are deliberately conservative and deterministic:
  *
- * Design decisions:
- *   - JSON canonicalization follows RFC 8785 (JOSON Canonicalization Scheme)
- *     for object key ordering and string escaping.
- *   - Numbers are normalized to a canonical decimal representation with a
- *     configurable maximum precision (default 7) to avoid floating-point
- *     drift between JavaScript runtimes and other languages.
- *   - Strings are NFC normalized (NFKC) and trimmed of leading/trailing
- *     whitespace for keys and optionally for values.
- *   - Legacy payloads (e.g. pre-canonical order, unnormalized numbers)
- *     are accepted via a compatibility path that normalizes them into the
- *     canonical form before hashing/signing.
+ *   - Object keys are sorted lexicographically (code-point order) and normalized
+ *     to lowercase with surrounding whitespace stripped.
+ *   - Strings are NFC-normalized and trimmed of surrounding whitespace.
+ *   - Numbers are rendered in a canonical form so `1.0`, `1.00` and `1` collide,
+ *     `-0` normalizes to `0`, and IEEE-754 precision is preserved.
+ *   - Array order is preserved by default because order is often semantic
+ *     (e.g. marketplace listings), but `normalizePayload` can be told to
+ *     sort arrays of primitives when order is not meaningful.
+ *   - `undefined`, functions and symbols are rejected outright so that a
+ *     signature can never be made over a partially-defined payload.
+ *   - Legacy payloads with dotted flat key paths, XML-style array wrappers
+ *     `{ item: [...] }`, or boolean strings `'TRUE'`/`'False'` are normalized
+ *     compatibly, while unknown legacy formats are rejected.
  *
- * @see https://datacludes.org/rfc/rfc8785.html
+ * The canonical encoding is a JSON-compatible document with sorted keys and
+ * no insignificant whitespace. This keeps it easy to inspect and to reuse
+ * existing JSON tooling while still being byte-stable.
  */
 
-const DEFAULT_MAX_PRECISION = 7;
-const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+import crypto from "node:crypto";
 
-const UNICODE_NORMALIZATION = 'NFC';
+export const CANONICAL_VERSION = "eduvault-canonical-v1";
 
-/**
- * Error thrown when a payload cannot be canonicalized.
- */
+/** Maximum number of fractional digits kept for canonical numbers. */
+export const MAX_PRECISION = 20;
+
+/** Maximum absolute magnitude allowed for canonical numbers. */
+export const MAX_MAGNITUDE = Number.MAX_SAFE_INTEGER;
+
+/** Thrown when a payload cannot be canonicalized. */
 export class CanonicalizationError extends Error {
-  constructor(message, code = 'EVT/CANONICALIZATION') {
+  constructor(message, path = "$") {
     super(message);
-    this.name = 'CanonicalizationError';
-    this.code = code;
+    this.name = "CanonicalizationError";
+    this.path = path;
   }
 }
 
-/**
- * Normalize a string for canonical output.
- *
- * - Applies Unicode NFC normalization so visually identical strings
- *   (e.g. composed vs decomposed accents) serialize identically.
- * - Trims leading/trailing whitespace when `trim` is true.
- * - Normalizes CR / CR + LF line endings to a single LF.
- */
-export function normalizeString(value, { trim = true } = {}) {
-  if (typeof value !== 'string') {
-    throw new CanonicalizationError(`Expected string, received ${typeof value}`, 'EVT/CANONICAL/TYPE');
-  }
-  let out = value.normalize(UNICODE_NORMALIZATION).replace(/\rn/g, '\n').replace(/\r/g, '\n');
-  if (trim) {
-    out = out.trim();
-  }
-  return out;
+/** Return true when the value is a plain object (not an array/Date/etc). */
+function isPlainObject(value) {
+  if (value === null || typeof value !== "object") return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 /**
- * Normalize a numeric value to a canonical decimal string.
- *
- * Handles:
- *   - integers (big and small) — returned as base-10 digits.
- *   - floats — rounded to `maxPrecision` decimal places, trailing zeros stripped.
- *   - numeric strings (e.g. "001.500") — normalized to the same form.
- *   - NaN / Infinity — rejected consistently.
- *
- * The result is always a string so that large integers and high-precision
- * decimals survive JSON serialization without loss.
+ * Normalize a string for canonical comparison:
+ *   - Unicode NFC so composite and decomposed forms collide.
+ *   - Normalize CR / CR + LF line endings to a single LF.
+ *   - Collapse internal runs of whitespace to a single space.
+ *   - Trim leading/trailing whitespace.
  */
-export function normalizeNumber(value, { maxPrecision = DEFAULT_MAX_PRECISION } = {}) {
-  if (!number.isInteger(maxPrecision) || maxPrecision < 0 || maxPrecision > 20) {
-    throw new CanonicalizationError('maxPrecision must be an integer between 0 and 20', 'EVT/CANONICAL/PRECISION');
+export function normalizeString(value) {
+  if (typeof value !== "string") {
+    throw new CanonicalizationError(`Expected string, received ${typeof value}`);
   }
+  return value
+    .normalize("NFC")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
 
+/**
+ * Normalize a numeric value to a canonical representation.
+ *
+ * Accepts finite numbers and numeric strings. Rejects NaN, Infinity,
+ * and numbers exceeding MAX_MAGNITUDE.
+ * Normalizes -0 to 0, integer floats (e.g. 1.0) to 1, while preserving
+ * standard decimal precision.
+ */
+export function normalizeNumber(value) {
   let num;
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) {
-      throw new CanonicalizationError('Non-finite numbers cannot be canonicalized', 'EVT/CANONICAL/NUMBER');
-    }
+  if (typeof value === "number") {
     num = value;
-  } else if (typeof value === 'string') {
+  } else if (typeof value === "string") {
     const trimmed = value.trim();
-    if (trimmed === '') {
-      throw new CanonicalizationError('Empty string is not a valid numeric value', 'EVT/CANONICAL/NUMBER');
-    }
-    if (!/^[+-]?\d+(\.\d+)?$/.test(trimmed)) {
-      throw new CanonicalizationError(`Invalid numeric string: ${value}`, 'EVT/CANONICAL/NUMBER');
-    }
+    if (!trimmed) throw new CanonicalizationError("Numeric value is empty");
     num = Number(trimmed);
-    if (!Number.isFinite(num)) {
-      throw new CanonicalizationError(`Numeric string out of range: ${value}`, 'EVT/CANONICAL/NUMBER');
-    }
-  } else if (typeof value === 'bigint') {
-    return value.toString(10);
+  } else if (typeof value === "bigint") {
+    num = Number(value);
   } else {
-    throw new CanonicalizationError(`Expected number or numeric string, received ${typeof value}`, 'EVT/CANONICAL/TYPE');
+    throw new CanonicalizationError(`Expected number, received ${typeof value}`);
   }
 
-  if (Number.isInteger(num) && Math.abs(num) <= MAX_SAFE_INTEGER) {
-    return num.toString(10);
+  if (!Number.isFinite(num)) {
+    throw new CanonicalizationError("Number must be finite");
   }
-
-  // Round to maxPrecision decimal places using a decimal-string path to
-  // avoid binary floating-point artifacts (e.g. 0.1 + 0.2).
-  const fixed = num.toFixed(maxPrecision);
-  const stripped = fixed.replace(/(\.\d*)?0.?$/, '$1');
-  return stripped === '-0' ? '0' : stripped;
+  if (Math.abs(num) > MAX_MAGNITUDE) {
+    throw new CanonicalizationError(`Number exceeds max magnitude (${MAX_MAGNITUDE})`);
+  }
+  if (Object.is(num, -0) || num === 0) {
+    return 0;
+  }
+  return num;
 }
 
 /**
- * Recursively normalize a value into its canonical JSON-compatible form.
+ * Normalize an arbitrary JSON-like payload into a canonical form.
  *
  * Options:
- *   - maxPrecision: max decimal places for non-integer numbers.
- *   - trimStrings: trim leading/trailing whitespace from string values.
- *   - dropUndefined: omit object keys whose value is `undefined`.
- *   - dropNull: omit object keys whose value is `null`.
- *   - normalizeKeys: apply NFC + trim to object keys.
+ *   - sortArrays: when true, arrays of primitives are sorted by their
+ *     canonical string representation. Arrays containing objects/arrays are
+ *     left in place because order is assumed to be meaningful.
+ *   - dropUndefined: when true, object keys whose value is `undefined` are
+ *     omitted instead of causing a rejection. Defaults to false so that
+ *     signing code fails loud on incomplete payloads.
  */
-export function normalizeValue(value, options = {}) {
-  const {
-    maxPrecision = DEFAULT_MAX_PRECISION,
-    trimStrings = true,
-    dropUndefined = true,
-    dropNull = false,
-    normalizeKeys = true,
-  } = options;
+export function normalizePayload(value, options = {}) {
+  const { sortArrays = false, dropUndefined = false } = options;
+  return normalizeValue(value, { sortArrays, dropUndefined }, "$");
+}
 
-  if (value === null) {
-    return null;
+function normalizeValue(value, options, path) {
+  if (value === null) return null;
+
+  const type = typeof value;
+
+  if (type === "string") return normalizeString(value);
+  if (type === "number") return normalizeNumber(value);
+  if (type === "boolean") return value;
+  if (type === "bigint") return normalizeNumber(value);
+
+  if (type === "undefined") {
+    if (options.dropUndefined) return undefined;
+    throw new CanonicalizationError("Undefined values are not allowed", path);
   }
 
-  if (typeof value === 'undefined') {
-    return undefined;
-  }
-
- if (typeof value === 'boolean') {
-    return value;
-  }
-
-  if (typeof value === 'string') {
-    return normalizeString(value, { trim: trimStrings });
-  }
-
- if (typeof value === 'number' || typeof value === 'bigint') {
-    return normalizeNumber(value, { maxPrecision });
+  if (type === "function" || type === "symbol") {
+    throw new CanonicalizationError(`${type} values are not allowed`, path);
   }
 
   if (Array.isArray(value)) {
-    return value.map((v) => normalizeValue(v, options));
+    const normalized = value.map((entry, index) =>
+      normalizeValue(entry, options, `${path}[${index}]`)
+    );
+    if (options.sortArrays && normalized.every(isPrimitive)) {
+      return [...normalized].sort(comparePrimitives);
+    }
+    return normalized;
   }
 
- if (typeof value === 'object') {
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new CanonicalizationError("Invalid Date", path);
+    }
+    return value.toISOString();
+  }
+
+  if (type === "object") {
+    if (!isPlainObject(value)) {
+      throw new CanonicalizationError(
+        `Only plain objects are allowed (received ${value.constructor?.name || "object"})`,
+        path
+      );
+    }
+
+    const rawKeys = Object.keys(value);
+    const normalizedEntries = [];
+    const seenKeys = new Set();
+    for (const rawKey of rawKeys) {
+      const normKey = rawKey.trim().toLowerCase();
+      if (seenKeys.has(normKey)) {
+        throw new CanonicalizationError(`Duplicate key after normalization: ${normKey}`, path);
+      }
+      seenKeys.add(normKey);
+      normalizedEntries.push({ rawKey, normKey });
+    }
+    normalizedEntries.sort((a, b) => (a.normKey < b.normKey ? -1 : a.normKey > b.normKey ? 1 : 0));
+
     const out = {};
-    const keys = Object.keys(value);
-    for (const key of keys) {
-      const raw = value[key];
-      if (raw === undefined && dropUndefined) continue;
-      if (raw === null && dropNull) continue;
-      const normalizedKey = normalizeKeys ? normalizeString(key, { trim: true }) : key;
-      out[normalizedKey] = normalizeValue(raw, options);
+    for (const { rawKey, normKey } of normalizedEntries) {
+      const normalizedValue = normalizeValue(value[rawKey], options, `${path}.${normKey}`);
+      if (normalizedValue === undefined) continue;
+      out[normKey] = normalizedValue;
     }
     return out;
   }
 
-  throw new CanonicalizationError(
-    `Unsupported value type for canonicalization: ${typeof value}`,
-    'EVT/CANONICAL/TYPE'
+  throw new CanonicalizationError(`Unsupported value of type ${type}`, path);
+}
+
+function isPrimitive(value) {
+  return (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
   );
 }
 
-/**
- * Serialize a normalized value to a canonical JSON string.
- *
- * Object keys are sorted by UTF-16 code unit order (RFC 8785). String
- * escaping follows the JSON specification with no insignificant whitespace.
- */
-export function serializeCanonical(value) {
-  if (value === null) return 'null';
-  if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (typeof value === 'string') return JSON.stringify(value);
-  if (typeof value === 'number' || typeof value === 'bigint') {
-    // Normalized numbers are already strings at this point; fall back safely.
-    return JSON.stringify(normalizeNumber(value));
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((v) => serializeCanonical(v)).join(',')}]`;
-  }
-  if (typeof value === 'object') {
-    const keys = Object.keys(value).sort();
-    const parts = keys.map((key) => {
-      const encodedKey = JSON.stringify(key);
-      const encodedValue = serializeCanonical(value[key]);
-      return `${encodedKey}:${encodedValue}`;
-    });
-    return `{${parts.join(',')}}`;
-  }
-  throw new CanonicalizationError(
-    `Unsupported value type for canonical serialization: ${typeof value}`,
-    'EVT/CANONICAL/TYPE'
-  );
+function comparePrimitives(a, b) {
+  const left = JSON.stringify(a);
+  const right = JSON.stringify(b);
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
 /**
- * Convenience wrapper: normalize then serialize a payload.
- *
- * This is the function callers should use before hashing, signing,
- * comparing, or verifying any payload.
+ * Serialize a payload to its canonical JSON string. Keys are sorted,
+ * normalized to lowercase, and the output contains no insignificant whitespace.
  */
-export function canonicalize(payload, options = {}) {
-  const normalized = normalizeValue(payload, options);
-  return serializeCanonical(normalized);
+export function canonicalize(value, options = {}) {
+  return JSON.stringify(normalizePayload(value, options));
+}
+
+/**
+ * Return valid JSON matching canonicalize.
+ */
+export function canonicalJson(value, options = {}) {
+  return canonicalize(value, options);
+}
+
+/**
+ * Serialize a primitive or payload to a canonical string.
+ * Top-level strings are formatted as `[value:string]` for type disambiguation,
+ * while objects and arrays are formatted as canonical JSON.
+ */
+export function canonicalString(value) {
+  if (typeof value === "string") {
+    return `[${normalizeString(value)}:string]`;
+  }
+  return canonicalJson(value);
+}
+
+/**
+ * Return the UTF-8 bytes of the canonical representation. Signing code
+ * should sign these bytes so that equivalent payloads produce identical
+ * signatures.
+ */
+export function canonicalBytes(value, options = {}) {
+  return new TextEncoder().encode(canonicalize(value, options));
+}
+
+/**
+ * Compare two payloads by their canonical representation. Returns true
+ * when the payloads are equivalent after normalization.
+ */
+export function isCanonicallyEqual(a, b, options = {}) {
+  try {
+    return canonicalize(a, options) === canonicalize(b, options);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -221,22 +261,170 @@ export function canonicalEqual(a, b, options = {}) {
 }
 
 /**
- * Legacy compatibility path.
- *
- * Older EduVault records may store payloads with:
- *   - non-canonical key ordering,
- *   - unnormalized numeric strings (e.g. "001.500"),
- *   - composed/uncomposed Unicode,
- *   - CRLF line endings,
- *   - whitespace-padded strings.
- *
- * This function accepts those shapes and normalizes them into the current
- * canonical form. It also reports whether the input was already canonical,
- * which is useful for migration tooling and audit logs.
+ * Assert that a payload is already in canonical form. Throws CanonicalizationError
+ * if keys are not lowercase, unsorted, contains unnormalized whitespace,
+ * or contains forbidden values.
+ */
+export function assertCanonical(payload, options = {}) {
+  if (payload === undefined) {
+    throw new CanonicalizationError("Payload cannot be undefined");
+  }
+  let canonical;
+  try {
+    canonical = canonicalize(payload, options);
+  } catch (err) {
+    throw new CanonicalizationError(`Payload is not canonical: ${err.message}`);
+  }
+
+  const original = JSON.stringify(payload);
+  if (original !== canonical) {
+    throw new CanonicalizationError("Payload is not in canonical form");
+  }
+}
+
+/**
+ * Unflattens dotted key paths (e.g. 'user.name' -> { user: { name: ... } }).
+ */
+function unflattenDottedKeys(obj) {
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+    return obj;
+  }
+  const result = {};
+  for (const [key, value] of Object.entries(obj)) {
+    const processedValue =
+      typeof value === "object" && value !== null && !Array.isArray(value)
+        ? unflattenDottedKeys(value)
+        : value;
+
+    if (key.includes(".")) {
+      const parts = key.split(".");
+      let current = result;
+      for (let i = 0; i < parts.length - 1; i++) {
+        const part = parts[i];
+        if (!current[part] || typeof current[part] !== "object" || Array.isArray(current[part])) {
+          current[part] = {};
+        }
+        current = current[part];
+      }
+      const last = parts[parts.length - 1];
+      if (
+        typeof current[last] === "object" &&
+        current[last] !== null &&
+        typeof processedValue === "object" &&
+        processedValue !== null
+      ) {
+        Object.assign(current[last], processedValue);
+      } else {
+        current[last] = processedValue;
+      }
+    } else {
+      if (
+        typeof result[key] === "object" &&
+        result[key] !== null &&
+        typeof processedValue === "object" &&
+        processedValue !== null
+      ) {
+        Object.assign(result[key], processedValue);
+      } else {
+        result[key] = processedValue;
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Normalize legacy payloads including:
+ *   - dotted flat key paths
+ *   - legacy XML/wrapper shapes `{ items: { item: [1, 2, 3] } }`
+ *   - legacy boolean strings ('TRUE'/'False' -> true/false)
+ * Rejects unknown legacy wrapper formats like `{ items: { wrapped: [1] } }`.
+ */
+export function normalizeLegacy(value, parentKey = "") {
+  if (value === null || value === undefined) return value;
+
+  if (typeof value === "string") {
+    const trimmed = value.trim().toLowerCase();
+    if (trimmed === "true") return true;
+    if (trimmed === "false") return false;
+    return value;
+  }
+
+  if (typeof value !== "object") {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeLegacy(item, parentKey));
+  }
+
+  const unflattened = unflattenDottedKeys(value);
+  const out = {};
+
+  for (const [key, rawVal] of Object.entries(unflattened)) {
+    if (rawVal !== null && typeof rawVal === "object" && !Array.isArray(rawVal)) {
+      const innerKeys = Object.keys(rawVal);
+      if (innerKeys.length === 1 && Array.isArray(rawVal[innerKeys[0]])) {
+        const innerKey = innerKeys[0];
+        const normalizedInnerKey = innerKey.trim().toLowerCase();
+        const singularParent = key.trim().toLowerCase().replace(/s$/, "");
+        if (normalizedInnerKey === "item" || normalizedInnerKey === singularParent) {
+          out[key] = rawVal[innerKey].map((item) => normalizeLegacy(item, key));
+          continue;
+        } else {
+          throw new CanonicalizationError(
+            `Unknown legacy format: array wrapper "${innerKey}" under "${key}"`
+          );
+        }
+      }
+    }
+
+    out[key] = normalizeLegacy(rawVal, key);
+  }
+
+  return out;
+}
+
+/**
+ * Normalizes legacy records and serializes to canonical JSON.
+ */
+export function canonicalizeLegacy(payload, options = {}) {
+  const normalized = normalizeLegacy(payload);
+  return canonicalize(normalized, options);
+}
+
+/**
+ * Deterministically compute a SHA-256 hex digest of a payload using canonical serialization.
+ */
+export function canonicalHash(payload, options = {}) {
+  let serialized;
+  if (typeof payload === "string") {
+    serialized = canonicalString(payload);
+  } else {
+    serialized = canonicalizeLegacy(payload, options);
+  }
+  return crypto.createHash("sha256").update(serialized).digest("hex");
+}
+
+/**
+ * Compatibility helper for legacy records.
+ * Normalizes them without throwing on undefined values so that legacy records
+ * can be re-signed or compared against new payloads.
+ */
+export function normalizeLegacyRecord(record, options = {}) {
+  if (record == null || typeof record !== "object") {
+    throw new CanonicalizationError("Legacy record must be an object");
+  }
+  const legacyNorm = normalizeLegacy(record);
+  return normalizePayload(legacyNorm, { dropUndefined: true, sortArrays: false, ...options });
+}
+
+/**
+ * Legacy compatibility path that reports whether the input was already canonical.
  */
 export function normalizeLegacyPayload(payload, options = {}) {
-  const canonical = canonicalize(payload, options);
-  const original = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  const canonical = canonicalizeLegacy(payload, options);
+  const original = typeof payload === "string" ? payload : JSON.stringify(payload);
   return {
     canonical,
     alreadyCanonical: original === canonical,

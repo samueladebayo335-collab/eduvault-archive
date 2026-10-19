@@ -28,6 +28,9 @@ export const COLLECTIONS = {
   indexerQuarantine: "indexer_quarantine",
   indexerOperatorAudit: "indexer_operator_audit",
   materialPreviews: "material_previews",
+  // #969: import rows held out of the write for an unsafe storageKey. Separate
+  // from the file-level `quarantine` collection used by uploads.
+  importQuarantine: "import_quarantine",
   // Off-chain mirrors maintained by the indexer for event types added in
   // #598 (payouts/escrow/dispute resolutions and the scholarship subsystem).
   bulkPurchases: "bulk_purchases",
@@ -38,8 +41,9 @@ export const COLLECTIONS = {
   adminTransfers: "admin_transfers",
   checkoutQuotes: "checkout_quotes",
   storageQuotaHistory: "storage_quota_history",
-  notifications: "notifications",
-  backgroundJobs: "background_jobs",
+  // Time-bounded maintainer impersonation / support access (see
+  // src/lib/auth/supportAccess.js). Immutable audit lives in audit_ledger.
+  supportSessions: "support_sessions",
 };
 
 export const REQUIRED_INDEXES = {
@@ -234,23 +238,23 @@ export const REQUIRED_INDEXES = {
   ],
   // #638: sandboxed preview descriptors, keyed by the original file's content
   // hash. A separate trust domain from the file itself and from `materials`.
+  // #969: review quarantined import rows for one batch, in file order.
+  import_quarantine: [
+    { keys: { importBatchId: 1, row: 1 }, options: { name: "import_quarantine_batch_idx", background: true } },
+  ],
   material_previews: [
     { keys: { contentHash: 1 }, options: { unique: true, name: "material_previews_content_hash_idx", background: true } },
     { keys: { state: 1, updatedAt: 1 }, options: { name: "material_previews_state_idx", background: true } },
   ],
-  // #794: one notification per (recipient, dedupeKey), so a retried event
-  // can't notify twice even when two workers race.
-  notifications: [
-    { keys: { recipient: 1, dedupeKey: 1 }, options: { unique: true, name: "notifications_dedupe_idx" } },
-    { keys: { recipient: 1, read: 1, createdAt: -1 }, options: { name: "notifications_inbox_idx" } },
-  ],
-  // #789: Background worker framework jobs queue indexes
-  background_jobs: [
-    { keys: { jobId: 1 }, options: { unique: true, name: "background_jobs_id_idx" } },
-    { keys: { idempotencyKey: 1 }, options: { unique: true, sparse: true, name: "background_jobs_idempotency_idx" } },
-    { keys: { status: 1, scheduledFor: 1, lockedUntil: 1 }, options: { name: "background_jobs_lease_idx", background: true } },
-    { keys: { name: 1, status: 1 }, options: { name: "background_jobs_name_status_idx", background: true } },
-    { keys: { createdAt: -1 }, options: { name: "background_jobs_created_idx", background: true } },
+  support_sessions: [
+    // Lookup is by hash of the bearer token, never the raw token.
+    { keys: { tokenHash: 1 }, options: { unique: true, name: "support_sessions_token_hash_idx" } },
+    // "Does this user have an active support session?" (user-facing notices).
+    { keys: { targetUserId: 1, status: 1, expiresAt: 1 }, options: { name: "support_sessions_target_idx" } },
+    // "Which sessions did this maintainer start?" (admin listing / forensics).
+    { keys: { actorId: 1, createdAt: -1 }, options: { name: "support_sessions_actor_idx" } },
+    // Scheduled expiry sweep (scripts/expire-support-sessions.mjs).
+    { keys: { status: 1, expiresAt: 1 }, options: { name: "support_sessions_expiry_idx" } },
   ],
 };
 
